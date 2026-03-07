@@ -1,0 +1,37 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  font-family: var(--font-geist-sans), Arial, Helvetica, sans-serif;
+}
+
+/* マークダウン風のスタイリング */
+.prose h1 { @apply text-2xl font-bold mb-3 mt-4; }
+.prose h2 { @apply text-xl font-bold mb-2 mt-3; }
+.prose h3 { @apply text-lg font-semibold mb-2 mt-2; }
+.prose p { @apply mb-2; }
+.prose ul { @apply list-disc pl-6 mb-2; }
+.prose ol { @apply list-decimal pl-6 mb-2; }
+.prose li { @apply mb-1; }
+.prose code { @apply bg-gray-100 px-1.5 py-0.5 rounded text-sm font-mono; }
+.prose pre { @apply bg-gray-900 text-gray-100 p-4 rounded-lg overflow-x-auto mb-3; }
+.prose pre code { @apply bg-transparent p-0; }
+.prose blockquote { @apply border-l-4 border-gray-300 pl-4 italic text-gray-600; }
+.prose hr { @apply my-4 border-gray-200; }
+.prose strong { @apply font-bold; }
+.prose table { @apply w-full border-collapse mb-3; }
+.prose th { @apply border border-gray-300 px-3 py-2 bg-gray-50 font-semibold text-left; }
+.prose td { @apply border border-gray-300 px-3 py-2; }
+
+/* SSEストリーミング中のカーソルアニメーション */
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+.streaming-cursor::after {
+  content: '|';
+  animation: blink 1s infinite;
+  color: #3b82f6;
+  font-weight: bold;
+}
