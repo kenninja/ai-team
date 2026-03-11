@@ -44,6 +44,14 @@ curl -s http://127.0.0.1:3000/api/slack/status
 ```
 `{"connected":true}` が返ればOK。
 
+## PC起動時の自動起動
+
+Windowsスタートアップに登録済み:
+- スクリプト: `ai-team/start-ai-team.vbs`
+- 登録先: `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\start-ai-team.vbs`
+- PC起動時にウィンドウなしでバックグラウンド実行される
+- 解除: `Win + R` → `shell:startup` → `start-ai-team.vbs` を削除
+
 ## テスト用エンドポイント
 
 - `http://localhost:3000/api/summary/test` — 日次サマリーを即時送信（開発環境のみ）

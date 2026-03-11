@@ -214,6 +214,12 @@ async function processNewEmails() {
                   action_id: 'mail_reply_edit',
                   value: JSON.stringify({ messageId: email.messageId, draft: analysis.reply_draft, subject: detail.subject, from: detail.from }),
                 },
+                {
+                  type: 'button',
+                  text: { type: 'plain_text', text: '🚫 返信不要' },
+                  action_id: 'mail_no_reply',
+                  value: JSON.stringify({ messageId: email.messageId, subject: detail.subject }),
+                },
               ],
             });
           }

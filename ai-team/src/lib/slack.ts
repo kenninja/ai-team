@@ -233,6 +233,38 @@ export async function initSlackApp(): Promise<void> {
     }
   });
 
+  // --- メール返信不要ボタン ---
+  slackApp.action('mail_no_reply', async ({ action, ack, client, body }) => {
+    await ack();
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const value = JSON.parse((action as any).value);
+      const { messageId, subject } = value;
+
+      const { markNoReplyNeeded } = await import('./db');
+      markNoReplyNeeded(messageId);
+
+      // 元メッセージを更新してボタンを消す
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const originalMessage = (body as any).message;
+      if (originalMessage) {
+        await client.chat.update({
+          channel: body.channel?.id || '',
+          ts: originalMessage.ts,
+          text: `🚫 返信不要「${subject}」`,
+          blocks: [
+            { type: 'section', text: { type: 'mrkdwn', text: `🚫 *返信不要にしました*\n件名: ${subject}` } },
+            { type: 'divider' },
+          ],
+        });
+      }
+
+      console.log(`[slack] 返信不要: ${subject}`);
+    } catch (err) {
+      console.error('[slack] 返信不要エラー:', err);
+    }
+  });
+
   // --- モーダル送信ハンドラー ---
   slackApp.view('mail_reply_modal', async ({ ack, view, client, body }) => {
     await ack();

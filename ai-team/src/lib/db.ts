@@ -312,6 +312,11 @@ export function markReplySent(messageId: string) {
   db.prepare('UPDATE processed_emails SET reply_sent = 1 WHERE message_id = ?').run(messageId);
 }
 
+export function markNoReplyNeeded(messageId: string) {
+  const db = getDb();
+  db.prepare('UPDATE processed_emails SET needs_reply = 0 WHERE message_id = ?').run(messageId);
+}
+
 export function updateReplyDraft(messageId: string, draft: string) {
   const db = getDb();
   db.prepare('UPDATE processed_emails SET reply_draft = ? WHERE message_id = ?').run(draft, messageId);
