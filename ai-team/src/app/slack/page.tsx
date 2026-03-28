@@ -18,6 +18,7 @@ interface SlackMessage {
   reply_urgency: string;
   reply_draft: string | null;
   reply_sent: number;
+  mentioned_me: number;
   summary: string;
   task_created: number;
   processed_at: number;

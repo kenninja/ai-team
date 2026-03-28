@@ -2,6 +2,7 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
+import { Building2 } from 'lucide-react';
 
 export default function Header() {
   const pathname = usePathname();
@@ -25,6 +26,16 @@ export default function Header() {
             ホーム
           </Link>
           <Link
+            href="/tasks"
+            className={`px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${
+              pathname?.startsWith('/tasks')
+                ? 'bg-blue-100 text-blue-700'
+                : 'text-gray-600 hover:text-gray-900 hover:bg-gray-100'
+            }`}
+          >
+            タスク
+          </Link>
+          <Link
             href="/mail"
             className={`px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${
               pathname?.startsWith('/mail')
@@ -43,6 +54,17 @@ export default function Header() {
             }`}
           >
             Slack
+          </Link>
+          <Link
+            href="/opening"
+            className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${
+              pathname?.startsWith('/opening')
+                ? 'bg-blue-100 text-blue-700'
+                : 'text-gray-600 hover:text-gray-900 hover:bg-gray-100'
+            }`}
+          >
+            <Building2 className="w-4 h-4 shrink-0" aria-hidden />
+            出店管理
           </Link>
           <Link
             href="/mail/invoices"

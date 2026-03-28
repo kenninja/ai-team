@@ -1,4 +1,5 @@
 import { App } from '@slack/bolt';
+import { WebClient } from '@slack/web-api';
 
 // Next.js dev modeではモジュールが複数回ロードされるため、globalThisで状態を共有
 const globalForSlack = globalThis as unknown as { __slackApp?: App };
@@ -13,6 +14,35 @@ function setSlackApp(app: App) {
 
 export function isSlackConnected(): boolean {
   return getSlackApp() !== null;
+}
+
+/**
+ * リマインドメッセージのBlocksから、対象メールのセクション+ボタンを完了表示に差し替える
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function updateReminderBlocks(blocks: any[], messageId: string, doneText: string): any[] {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const result: any[] = [];
+  for (let i = 0; i < blocks.length; i++) {
+    const block = blocks[i];
+    // actionsブロックにmessageIdが含まれているか確認
+    if (block.type === 'actions' && block.elements) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const hasTarget = block.elements.some((el: any) => {
+        try { return JSON.parse(el.value || '{}').messageId === messageId; } catch { return false; }
+      });
+      if (hasTarget) {
+        // 直前のsectionブロック（メール情報）を完了表示に差し替え
+        if (result.length > 0 && result[result.length - 1].type === 'section') {
+          result[result.length - 1] = { type: 'section', text: { type: 'mrkdwn', text: `~${doneText}~` } };
+        }
+        // actionsブロック（ボタン）は削除
+        continue;
+      }
+    }
+    result.push(block);
+  }
+  return result;
 }
 
 export async function initSlackApp(): Promise<void> {
@@ -119,23 +149,47 @@ export async function initSlackApp(): Promise<void> {
       mentionedMe,
     });
 
-    // タスク自動作成
-    try {
-      const { waitForRateLimit } = await import('./rate-limiter');
-      await waitForRateLimit();
-      const { analyzeAndCreateTask } = await import('./task-creator');
-      const taskResult = await analyzeAndCreateTask({
-        source: 'slack',
-        sourceId: `${channelId}:${messageTs}`,
-        senderName: userName,
-        text: msg.text,
-        channelOrThread: `#${channelName}`,
-      });
-      if (taskResult.created) {
-        markSlackTaskCreated(channelId, messageTs);
+    // タスク自動作成（メンション時のみ）
+    if (mentionedMe) {
+      try {
+        const { waitForRateLimit } = await import('./rate-limiter');
+        await waitForRateLimit();
+        const { analyzeAndCreateTask } = await import('./task-creator');
+        const taskResult = await analyzeAndCreateTask({
+          source: 'slack',
+          sourceId: `${channelId}:${messageTs}`,
+          senderName: userName,
+          text: msg.text,
+          channelOrThread: `#${channelName}`,
+        });
+        if (taskResult.created) {
+          markSlackTaskCreated(channelId, messageTs);
+          console.log(`[slack] タスク作成完了（メンション）: ${userName}`);
+
+          // DM通知
+          const myUserId = process.env.SLACK_MY_USER_ID;
+          console.log('[slack] DM通知試みる:', myUserId, taskResult.task);
+          if (myUserId && taskResult.task) {
+            const deadlineLabel = taskResult.task.deadline
+              ? `期限: ${taskResult.task.deadline}`
+              : '期限: 未設定';
+            try {
+              const dm = await client.conversations.open({ users: myUserId });
+              const dmChannelId = dm.channel?.id;
+              if (dmChannelId) {
+                await client.chat.postMessage({
+                  channel: dmChannelId,
+                  text: `✅ タスクを作成しました\n「${taskResult.task.title}」\n${deadlineLabel}\n（${userName} からのメンション）`,
+                });
+              }
+            } catch (e) {
+              console.error('[slack] DM通知エラー:', e);
+            }
+          }
+        }
+      } catch (err) {
+        console.error('[slack] タスク作成エラー:', err);
       }
-    } catch (err) {
-      console.error('[slack] タスク作成エラー:', err);
     }
 
     console.log(`[slack] 処理完了: #${channelName} ${userName} (返信要: ${analysis.needs_reply})`);
@@ -265,6 +319,77 @@ export async function initSlackApp(): Promise<void> {
     }
   });
 
+  // --- リマインド: 対応済みボタン ---
+  slackApp.action('reminder_mark_replied', async ({ action, ack, client, body }) => {
+    await ack();
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const value = JSON.parse((action as any).value);
+      const { messageId, subject } = value;
+
+      const { markReplySent } = await import('./db');
+      markReplySent(messageId);
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const msg = (body as any).message;
+      if (msg) {
+        const blocks = updateReminderBlocks(msg.blocks, messageId, `✅ 対応済み「${subject}」`);
+        await client.chat.update({ channel: body.channel?.id || '', ts: msg.ts, text: msg.text, blocks });
+      }
+      console.log(`[slack] リマインド対応済み: ${subject}`);
+    } catch (err) {
+      console.error('[slack] リマインド対応済みエラー:', err);
+    }
+  });
+
+  // --- リマインド: 返信不要ボタン ---
+  slackApp.action('reminder_no_reply', async ({ action, ack, client, body }) => {
+    await ack();
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const value = JSON.parse((action as any).value);
+      const { messageId, subject } = value;
+
+      const { markNoReplyNeeded } = await import('./db');
+      markNoReplyNeeded(messageId);
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const msg = (body as any).message;
+      if (msg) {
+        const blocks = updateReminderBlocks(msg.blocks, messageId, `🚫 返信不要「${subject}」`);
+        await client.chat.update({ channel: body.channel?.id || '', ts: msg.ts, text: msg.text, blocks });
+      }
+      console.log(`[slack] リマインド返信不要: ${subject}`);
+    } catch (err) {
+      console.error('[slack] リマインド返信不要エラー:', err);
+    }
+  });
+
+  // --- リマインド: 全件クリアボタン ---
+  slackApp.action('reminder_clear_all', async ({ ack, client, body }) => {
+    await ack();
+    try {
+      const { markAllUnrepliedAsNoReply } = await import('./db');
+      const cleared = markAllUnrepliedAsNoReply();
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const msg = (body as any).message;
+      if (msg) {
+        await client.chat.update({
+          channel: body.channel?.id || '',
+          ts: msg.ts,
+          text: `🗑️ 未返信 ${cleared}件 を全てクリアしました`,
+          blocks: [
+            { type: 'section', text: { type: 'mrkdwn', text: `🗑️ *未返信 ${cleared}件 を全てクリアしました*` } },
+          ],
+        });
+      }
+      console.log(`[slack] 一括クリア: ${cleared}件`);
+    } catch (err) {
+      console.error('[slack] 一括クリアエラー:', err);
+    }
+  });
+
   // --- モーダル送信ハンドラー ---
   slackApp.view('mail_reply_modal', async ({ ack, view, client, body }) => {
     await ack();
@@ -341,4 +466,23 @@ export async function sendSlackDM(userId: string, text: string): Promise<string>
     text,
   });
   return result.ts || '';
+}
+
+/**
+ * Bolt 未接続でも動く DM 送信（cron / API ルート用）
+ */
+export async function notifySlackDmText(text: string): Promise<void> {
+  const userId = process.env.SLACK_MY_USER_ID;
+  const botToken = process.env.SLACK_BOT_TOKEN;
+  if (!userId || !botToken) return;
+
+  try {
+    const client = new WebClient(botToken);
+    const dm = await client.conversations.open({ users: userId });
+    const channelId = dm.channel?.id;
+    if (!channelId) return;
+    await client.chat.postMessage({ channel: channelId, text });
+  } catch (e) {
+    console.error('[slack] notifySlackDmText エラー:', e);
+  }
 }

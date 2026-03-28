@@ -1,72 +1,85 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import Header from '@/components/Header';
+import { InvoiceForm } from '@/components/invoice/InvoiceForm';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Invoice = Record<string, any>;
 
-const ACCOUNT_TITLES = [
-  '通信費', '水道光熱費', '荷造運賃', '消耗品費', '旅費交通費',
-  '接待交際費', '広告宣伝費', '支払手数料', '地代家賃', '保険料',
-  '修繕費', '外注費', '会議費', '新聞図書費', '雑費',
-];
+type StatusFilter = 'all' | 'pending' | 'ready' | 'exported';
 
-const TAX_CATEGORIES = ['課税仕入10%', '課税仕入8%', '非課税仕入', '不課税仕入'];
-const DEPARTMENTS = ['IT部', '管理部', '営業部', '経理部', '総務部'];
+const statusConfig: Record<string, { label: string; className: string }> = {
+  pending:  { label: '未処理',      className: 'bg-red-50 text-red-600' },
+  ready:    { label: 'CSV出力待ち', className: 'bg-amber-50 text-amber-700' },
+  exported: { label: 'MF登録済み',  className: 'bg-green-50 text-green-700' },
+};
 
 export default function InvoicesPage() {
   const [invoices, setInvoices] = useState<Invoice[]>([]);
-  const [selectedIds, setSelectedIds] = useState<number[]>([]);
-  const [editingId, setEditingId] = useState<number | null>(null);
-  const [editData, setEditData] = useState<Invoice>({});
-  const [showExportModal, setShowExportModal] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [filter, setFilter] = useState<StatusFilter>('all');
+  const [showForm, setShowForm] = useState(false);
+  const [editingInvoice, setEditingInvoice] = useState<Invoice | undefined>(undefined);
+  const [selectedIds, setSelectedIds] = useState<number[]>([]);
+  const [mfVendorCount, setMfVendorCount] = useState(0);
+  const [mfMatches, setMfMatches] = useState<Record<number, boolean>>({});
+  const mfFileInputRef = useRef<HTMLInputElement>(null);
 
-  useEffect(() => {
+  const fetchInvoices = () => {
     fetch('/api/invoices')
       .then(res => res.json())
-      .then(data => { setInvoices(data); setLoading(false); })
+      .then(data => {
+        setInvoices(data);
+        setLoading(false);
+        // MFマッチチェック
+        const names = data.map((inv: Invoice) => inv.vendor_name).filter(Boolean);
+        if (names.length > 0) {
+          fetch('/api/mf-vendors/check', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ vendorNames: Array.from(new Set(names)) }),
+          })
+            .then(r => r.json())
+            .then((matches: Record<string, boolean>) => {
+              const byId: Record<number, boolean> = {};
+              data.forEach((inv: Invoice) => {
+                byId[inv.id] = inv.vendor_name ? (matches[inv.vendor_name] ?? false) : false;
+              });
+              setMfMatches(byId);
+            })
+            .catch(() => {});
+        }
+      })
       .catch(() => setLoading(false));
-  }, []);
-
-  const handleEdit = (inv: Invoice) => {
-    setEditingId(inv.id);
-    setEditData({ ...inv });
   };
 
-  const handleSave = async () => {
-    if (!editingId) return;
-    const res = await fetch('/api/invoices', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: editingId, ...editData }),
-    });
-    const updated = await res.json();
-    setInvoices(prev => prev.map(inv => inv.id === editingId ? updated : inv));
-    setEditingId(null);
+  const refreshMfCount = () => {
+    fetch('/api/mf-vendors').then(r => r.json()).then(d => setMfVendorCount(d.count)).catch(() => {});
   };
 
-  const handleConfirm = async (id: number) => {
-    const res = await fetch('/api/invoices', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id, status: 'confirmed' }),
-    });
-    const updated = await res.json();
-    setInvoices(prev => prev.map(inv => inv.id === id ? updated : inv));
-  };
+  useEffect(() => { fetchInvoices(); refreshMfCount(); }, []);
 
-  const handleExport = async (format: string) => {
-    const ids = selectedIds.length > 0 ? selectedIds :
-      invoices.filter(inv => inv.status === 'confirmed').map(inv => inv.id);
+  // フィルタ適用
+  const filtered = filter === 'all' ? invoices : invoices.filter(inv => inv.status === filter);
 
-    if (ids.length === 0) return;
+  // サマリー集計
+  const pendingCount = invoices.filter(inv => inv.status === 'pending').length;
+  const readyCount = invoices.filter(inv => inv.status === 'ready').length;
+  const exportedCount = invoices.filter(inv => inv.status === 'exported').length;
+  const monthlyTotal = invoices
+    .filter(inv => inv.status !== 'exported')
+    .reduce((sum, inv) => sum + (inv.total_amount || 0), 0);
+
+  // CSV出力
+  const handleMFExport = async () => {
+    const readyIds = invoices.filter(inv => inv.status === 'ready').map(inv => inv.id);
+    if (readyIds.length === 0) return;
 
     const res = await fetch('/api/invoices/export', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ids, format }),
+      body: JSON.stringify({ ids: readyIds, format: 'mf_auto' }),
     });
 
     const blob = await res.blob();
@@ -74,15 +87,31 @@ export default function InvoicesPage() {
     const a = document.createElement('a');
     a.href = url;
     const dateStr = new Date().toISOString().split('T')[0];
-    a.download = `invoices_${format}_${dateStr}.csv`;
+    a.download = `invoices_mf_${dateStr}.csv`;
     a.click();
     URL.revokeObjectURL(url);
 
-    setShowExportModal(false);
+    // ステータスをexportedに更新
+    setTimeout(async () => {
+      await fetch('/api/invoices/bulk-status', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: readyIds, status: 'exported' }),
+      });
+      fetchInvoices();
+    }, 1500);
+  };
 
-    // 一覧を再取得
-    const refreshRes = await fetch('/api/invoices');
-    setInvoices(await refreshRes.json());
+  const handleDelete = async (id: number, vendorName: string) => {
+    if (!confirm(`「${vendorName || '取引先不明'}」の請求書を削除しますか？`)) return;
+    const res = await fetch('/api/invoices', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id }),
+    });
+    if (res.ok) {
+      setInvoices(prev => prev.filter(inv => inv.id !== id));
+    }
   };
 
   const toggleSelect = (id: number) => {
@@ -91,38 +120,104 @@ export default function InvoicesPage() {
     );
   };
 
-  const confirmedCount = invoices.filter(inv => inv.status === 'confirmed').length;
-
   return (
     <div className="min-h-screen flex flex-col">
       <Header />
       <main className="flex-1 p-6">
         <div className="max-w-6xl mx-auto">
+          {/* ヘッダー */}
           <div className="flex items-center justify-between mb-6">
             <div>
               <h1 className="text-2xl font-bold text-gray-900">請求書管理</h1>
               <p className="text-sm text-gray-500 mt-1">
-                メールから抽出された請求書を確認・編集し、MoneyForward用CSVを出力できます
+                請求書の登録・ステータス管理・MF用CSV出力
               </p>
             </div>
-            <button
-              onClick={() => setShowExportModal(true)}
-              disabled={confirmedCount === 0 && selectedIds.length === 0}
-              className="px-4 py-2 bg-green-600 text-white rounded-lg text-sm font-medium hover:bg-green-700 disabled:bg-gray-300 disabled:cursor-not-allowed transition-colors"
-            >
-              CSV出力 ({selectedIds.length > 0 ? selectedIds.length : confirmedCount}件)
-            </button>
+            <div className="flex items-center gap-2">
+              <input
+                ref={mfFileInputRef}
+                type="file"
+                accept=".csv"
+                onChange={async (e) => {
+                  const file = e.target.files?.[0];
+                  if (!file) return;
+                  const form = new FormData();
+                  form.append('file', file);
+                  const res = await fetch('/api/mf-vendors/import', { method: 'POST', body: form });
+                  const data = await res.json();
+                  alert(`${data.imported}件の支払先を取り込みました`);
+                  refreshMfCount();
+                  fetchInvoices();
+                  if (mfFileInputRef.current) mfFileInputRef.current.value = '';
+                }}
+                className="hidden"
+              />
+              <button
+                onClick={() => mfFileInputRef.current?.click()}
+                className="px-3 py-2 bg-gray-100 text-gray-600 rounded-lg text-xs font-medium hover:bg-gray-200 transition-colors"
+              >
+                MF支払先マスタ更新{mfVendorCount > 0 && ` (${mfVendorCount}件)`}
+              </button>
+              <button
+                onClick={() => { setEditingInvoice(undefined); setShowForm(true); }}
+                className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 transition-colors"
+              >
+                + 新規登録
+              </button>
+              <button
+                onClick={handleMFExport}
+                disabled={readyCount === 0}
+                className="px-4 py-2 bg-green-600 text-white rounded-lg text-sm font-medium hover:bg-green-700 disabled:bg-gray-300 disabled:cursor-not-allowed transition-colors"
+              >
+                MF用CSV出力 ({readyCount}件)
+              </button>
+            </div>
           </div>
 
+          {/* サマリーカード */}
+          <div className="grid grid-cols-4 gap-3 mb-6">
+            {[
+              { label: '未処理', val: `${pendingCount}件`, color: 'text-red-500', bg: 'bg-red-50' },
+              { label: 'CSV出力待ち', val: `${readyCount}件`, color: 'text-amber-600', bg: 'bg-amber-50' },
+              { label: 'MF登録済み', val: `${exportedCount}件`, color: 'text-green-600', bg: 'bg-green-50' },
+              { label: '今月 未処理合計', val: `\u00A5${monthlyTotal.toLocaleString()}`, color: 'text-gray-900', bg: 'bg-white' },
+            ].map(item => (
+              <div key={item.label} className={`p-4 rounded-2xl border-2 border-gray-200 shadow-sm text-center ${item.bg}`}>
+                <p className={`text-2xl font-bold ${item.color}`}>{item.val}</p>
+                <p className="text-xs text-gray-500 mt-1">{item.label}</p>
+              </div>
+            ))}
+          </div>
+
+          {/* ステータスフィルタ */}
+          <div className="flex gap-2 mb-4">
+            {([
+              { key: 'all' as StatusFilter, label: '全件' },
+              { key: 'pending' as StatusFilter, label: '未処理' },
+              { key: 'ready' as StatusFilter, label: 'CSV出力待ち' },
+              { key: 'exported' as StatusFilter, label: 'MF登録済み' },
+            ]).map(f => (
+              <button
+                key={f.key}
+                onClick={() => setFilter(f.key)}
+                className={`text-xs px-3 py-1.5 rounded-full font-medium transition-colors ${
+                  filter === f.key
+                    ? 'bg-gray-900 text-white'
+                    : 'bg-gray-100 text-gray-500 hover:bg-gray-200'
+                }`}
+              >
+                {f.label}
+              </button>
+            ))}
+          </div>
+
+          {/* テーブル */}
           {loading ? (
             <div className="text-center text-gray-400 py-12">読み込み中...</div>
-          ) : invoices.length === 0 ? (
+          ) : filtered.length === 0 ? (
             <div className="text-center text-gray-400 py-12">
-              <span className="text-4xl block mb-3">📄</span>
-              <p>請求書がありません</p>
-              <a href="/mail" className="text-blue-600 hover:underline text-sm mt-2 block">
-                メール画面でAI分析を実行してください
-              </a>
+              <p className="text-lg mb-2">請求書がありません</p>
+              <p className="text-sm">「+ 新規登録」から請求書を登録してください</p>
             </div>
           ) : (
             <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
@@ -132,13 +227,14 @@ export default function InvoicesPage() {
                     <th className="px-3 py-2 text-left w-8">
                       <input type="checkbox" className="rounded" onChange={(e) => {
                         if (e.target.checked) {
-                          setSelectedIds(invoices.map(inv => inv.id));
+                          setSelectedIds(filtered.map(inv => inv.id));
                         } else {
                           setSelectedIds([]);
                         }
                       }} />
                     </th>
                     <th className="px-3 py-2 text-left">取引先</th>
+                    <th className="px-3 py-2 text-left">種別</th>
                     <th className="px-3 py-2 text-left">請求日</th>
                     <th className="px-3 py-2 text-left">支払期日</th>
                     <th className="px-3 py-2 text-right">金額</th>
@@ -148,7 +244,7 @@ export default function InvoicesPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {invoices.map(inv => (
+                  {filtered.map(inv => (
                     <tr key={inv.id} className="border-b border-gray-100 hover:bg-gray-50">
                       <td className="px-3 py-2">
                         <input
@@ -159,37 +255,40 @@ export default function InvoicesPage() {
                         />
                       </td>
                       <td className="px-3 py-2 font-medium">{inv.vendor_name || '-'}</td>
+                      <td className="px-3 py-2">
+                        {mfMatches[inv.id] ? (
+                          <span className="text-xs px-2 py-0.5 rounded-full bg-green-50 text-green-700 font-medium">登録済み</span>
+                        ) : (
+                          <span className="text-xs px-2 py-0.5 rounded-full bg-gray-100 text-gray-500">スポット</span>
+                        )}
+                      </td>
                       <td className="px-3 py-2">{inv.invoice_date || '-'}</td>
                       <td className="px-3 py-2">{inv.due_date || '-'}</td>
                       <td className="px-3 py-2 text-right">
-                        {inv.total_amount ? `¥${Number(inv.total_amount).toLocaleString()}` : '-'}
+                        {inv.total_amount ? `\u00A5${Number(inv.total_amount).toLocaleString()}` : '-'}
                       </td>
                       <td className="px-3 py-2">{inv.account_title || '-'}</td>
                       <td className="px-3 py-2">
-                        <span className={`text-xs px-2 py-0.5 rounded ${
-                          inv.status === 'draft' ? 'bg-yellow-100 text-yellow-700' :
-                          inv.status === 'confirmed' ? 'bg-blue-100 text-blue-700' :
-                          'bg-green-100 text-green-700'
+                        <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
+                          statusConfig[inv.status]?.className ?? 'bg-gray-100 text-gray-500'
                         }`}>
-                          {inv.status === 'draft' ? '下書き' : inv.status === 'confirmed' ? '確定' : '出力済'}
+                          {statusConfig[inv.status]?.label ?? inv.status}
                         </span>
                       </td>
                       <td className="px-3 py-2">
                         <div className="flex gap-1">
                           <button
-                            onClick={() => handleEdit(inv)}
+                            onClick={() => { setEditingInvoice(inv); setShowForm(true); }}
                             className="text-xs text-blue-600 hover:underline"
                           >
                             編集
                           </button>
-                          {inv.status === 'draft' && (
-                            <button
-                              onClick={() => handleConfirm(inv.id)}
-                              className="text-xs text-green-600 hover:underline ml-2"
-                            >
-                              確定
-                            </button>
-                          )}
+                          <button
+                            onClick={() => handleDelete(inv.id, inv.vendor_name)}
+                            className="text-xs text-red-500 hover:underline ml-2"
+                          >
+                            削除
+                          </button>
                         </div>
                       </td>
                     </tr>
@@ -201,117 +300,18 @@ export default function InvoicesPage() {
         </div>
       </main>
 
-      {/* 編集モーダル */}
-      {editingId && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-          <div className="bg-white rounded-xl p-6 w-full max-w-lg max-h-[90vh] overflow-y-auto">
-            <h3 className="text-lg font-bold mb-4">請求書を編集</h3>
-            <div className="space-y-3">
-              <div>
-                <label className="block text-xs font-medium text-gray-600 mb-1">取引先名</label>
-                <input value={editData.vendor_name || ''} onChange={e => setEditData({...editData, vendor_name: e.target.value})}
-                  className="w-full border rounded-lg px-3 py-2 text-sm" />
-              </div>
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-xs font-medium text-gray-600 mb-1">請求日</label>
-                  <input type="date" value={editData.invoice_date || ''} onChange={e => setEditData({...editData, invoice_date: e.target.value})}
-                    className="w-full border rounded-lg px-3 py-2 text-sm" />
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-gray-600 mb-1">支払期日</label>
-                  <input type="date" value={editData.due_date || ''} onChange={e => setEditData({...editData, due_date: e.target.value})}
-                    className="w-full border rounded-lg px-3 py-2 text-sm" />
-                </div>
-              </div>
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-xs font-medium text-gray-600 mb-1">税込金額</label>
-                  <input type="number" value={editData.total_amount || ''} onChange={e => setEditData({...editData, total_amount: parseInt(e.target.value) || 0})}
-                    className="w-full border rounded-lg px-3 py-2 text-sm" />
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-gray-600 mb-1">消費税額</label>
-                  <input type="number" value={editData.tax_amount || ''} onChange={e => setEditData({...editData, tax_amount: parseInt(e.target.value) || 0})}
-                    className="w-full border rounded-lg px-3 py-2 text-sm" />
-                </div>
-              </div>
-              <div>
-                <label className="block text-xs font-medium text-gray-600 mb-1">摘要</label>
-                <input value={editData.description || ''} onChange={e => setEditData({...editData, description: e.target.value})}
-                  className="w-full border rounded-lg px-3 py-2 text-sm" />
-              </div>
-              <div>
-                <label className="block text-xs font-medium text-gray-600 mb-1">勘定科目</label>
-                <select value={editData.account_title || ''} onChange={e => setEditData({...editData, account_title: e.target.value})}
-                  className="w-full border rounded-lg px-3 py-2 text-sm">
-                  <option value="">選択してください</option>
-                  {ACCOUNT_TITLES.map(t => <option key={t} value={t}>{t}</option>)}
-                </select>
-              </div>
-              <div>
-                <label className="block text-xs font-medium text-gray-600 mb-1">税区分</label>
-                <select value={editData.tax_category || ''} onChange={e => setEditData({...editData, tax_category: e.target.value})}
-                  className="w-full border rounded-lg px-3 py-2 text-sm">
-                  <option value="">選択してください</option>
-                  {TAX_CATEGORIES.map(t => <option key={t} value={t}>{t}</option>)}
-                </select>
-              </div>
-              <div>
-                <label className="block text-xs font-medium text-gray-600 mb-1">部門</label>
-                <select value={editData.department || ''} onChange={e => setEditData({...editData, department: e.target.value})}
-                  className="w-full border rounded-lg px-3 py-2 text-sm">
-                  <option value="">選択してください</option>
-                  {DEPARTMENTS.map(d => <option key={d} value={d}>{d}</option>)}
-                </select>
-              </div>
-            </div>
-            <div className="flex gap-2 justify-end mt-6">
-              <button onClick={() => setEditingId(null)} className="px-4 py-2 text-sm text-gray-600 hover:text-gray-900">
-                キャンセル
-              </button>
-              <button onClick={handleSave} className="px-4 py-2 bg-blue-600 text-white text-sm rounded-lg hover:bg-blue-700">
-                保存
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* CSV出力モーダル */}
-      {showExportModal && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-          <div className="bg-white rounded-xl p-6 w-full max-w-sm">
-            <h3 className="text-lg font-bold mb-4">CSV出力形式を選択</h3>
-            <div className="space-y-2">
-              <button
-                onClick={() => handleExport('simple')}
-                className="w-full text-left px-4 py-3 border rounded-lg hover:bg-gray-50 transition-colors"
-              >
-                <div className="font-medium text-sm">簡易CSV</div>
-                <div className="text-xs text-gray-500">基本的な請求書データ</div>
-              </button>
-              <button
-                onClick={() => handleExport('mf_spot')}
-                className="w-full text-left px-4 py-3 border rounded-lg hover:bg-gray-50 transition-colors"
-              >
-                <div className="font-medium text-sm">MF スポット支払</div>
-                <div className="text-xs text-gray-500">未登録の支払先用（41列）</div>
-              </button>
-              <button
-                onClick={() => handleExport('mf_registered')}
-                className="w-full text-left px-4 py-3 border rounded-lg hover:bg-gray-50 transition-colors"
-              >
-                <div className="font-medium text-sm">MF 登録済み支払先</div>
-                <div className="text-xs text-gray-500">登録済み支払先用（36列）</div>
-              </button>
-            </div>
-            <button
-              onClick={() => setShowExportModal(false)}
-              className="w-full mt-4 px-4 py-2 text-sm text-gray-600 hover:text-gray-900 text-center"
-            >
-              キャンセル
-            </button>
+      {/* 新規登録・編集モーダル */}
+      {showForm && (
+        <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50">
+          <div className="bg-white rounded-2xl shadow-xl w-full max-w-lg mx-4 p-6 max-h-[90vh] overflow-y-auto">
+            <h2 className="text-base font-semibold mb-4">
+              {editingInvoice ? '請求書を編集' : '請求書を登録'}
+            </h2>
+            <InvoiceForm
+              invoice={editingInvoice}
+              onSave={() => { setShowForm(false); fetchInvoices(); }}
+              onCancel={() => setShowForm(false)}
+            />
           </div>
         </div>
       )}

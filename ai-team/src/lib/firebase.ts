@@ -24,7 +24,7 @@ const getSyncCode = () => process.env.FIREBASE_SYNC_CODE || 'gts555';
 export interface FirestoreTask {
   id: string;
   title: string;
-  source: 'slack' | 'mail' | 'other';
+  source: 'slack' | 'mail' | 'other' | 'gmail';
   deadline: string | null;
   deadlineTime: string | null;
   priority: 'high' | 'medium' | 'low';
@@ -34,6 +34,11 @@ export interface FirestoreTask {
   createdAt: string;
   notified: boolean;
   alertNotified: boolean;
+  /** Gmail 分類タスク用（mailId で重複防止） */
+  category?: string;
+  status?: string;
+  mailId?: string;
+  suggestedAction?: string;
 }
 
 export async function readTasks(): Promise<FirestoreTask[]> {
@@ -53,4 +58,19 @@ export async function appendTask(task: FirestoreTask): Promise<void> {
   existing.unshift(task);
   await updateDoc(docRef, { tasks: existing });
   console.log(`[firebase] タスク追加: "${task.title}" (source: ${task.source})`);
+}
+
+/**
+ * mailId が未登録のときだけタスクを追加する（重複防止）
+ */
+export async function appendGmailClassifiedTaskIfNew(task: FirestoreTask): Promise<boolean> {
+  if (!task.mailId) return false;
+  const db = getFirestoreDb();
+  const docRef = doc(db, 'rooms', getSyncCode());
+  const existing = await readTasks();
+  if (existing.some((t) => t.mailId === task.mailId)) return false;
+  existing.unshift(task);
+  await updateDoc(docRef, { tasks: existing });
+  console.log(`[firebase] Gmail分類タスク追加: "${task.title}" mailId=${task.mailId}`);
+  return true;
 }

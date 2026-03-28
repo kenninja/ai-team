@@ -3,6 +3,8 @@
  * invoice-appから移植
  */
 
+import { findMFVendorByName } from './db';
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Invoice = Record<string, any>;
 
@@ -126,6 +128,67 @@ export function generateMFRegisteredCSV(invoices: Invoice[]): string {
     detailRow[15] = escapeCSV(inv.sub_account);
     detailRow[22] = 'JPY';
     detailRow[23] = '1';
+    rows.push(detailRow.join(','));
+  }
+
+  return BOM + [headers.join(','), ...rows].join('\n');
+}
+
+/**
+ * MF自動振り分けCSV — 登録済み・スポットを自動判定して1つのCSVに出力
+ */
+export function generateMFAutoCSV(invoices: Invoice[]): string {
+  const BOM = '\uFEFF';
+
+  const headers = [
+    '行形式', '支払先', '支払先（表示名）', '支払先コード', '支払先部門名',
+    '支払先敬称', '郵便番号', '都道府県', '市区町村', '番地',
+    '建物名等', '電話番号', '銀行名', '支店名', '口座種別',
+    '口座番号', '口座名義', '費用計上日', '支払期日', '支払方法',
+    '品目', '経費科目', '税区分', '単価（税抜）', '数量',
+    '金額（税抜）', '消費税額', '源泉徴収額', '費用負担部門', '貸方勘定科目',
+    '貸方補助科目', 'メモ', 'タグ', 'セグメント1', 'セグメント2',
+    'セグメント3', 'プロジェクト', '通貨', 'レート', '支払依頼メモ',
+    '承認者（ログインメールアドレス）'
+  ];
+
+  const rows: string[] = [];
+
+  for (const inv of invoices) {
+    const vendorName = inv.vendor_name ?? '';
+    const taxExcluded = (inv.total_amount || 0) - (inv.tax_amount || 0);
+
+    const mfVendor = findMFVendorByName(vendorName);
+    const accountItem = inv.account_title ?? mfVendor?.default_account_item ?? '';
+
+    // 支払依頼行
+    const paymentRow = new Array(41).fill('');
+    paymentRow[0] = '支払依頼';
+    paymentRow[1] = mfVendor ? escapeCSV(mfVendor.vendor_name) : escapeCSV(vendorName);
+    if (!mfVendor) {
+      paymentRow[2] = escapeCSV(vendorName);
+    } else {
+      paymentRow[2] = escapeCSV(mfVendor.vendor_name_short ?? vendorName);
+      paymentRow[3] = escapeCSV(mfVendor.vendor_code);
+    }
+    paymentRow[17] = escapeCSV(inv.invoice_date);
+    paymentRow[18] = escapeCSV(inv.due_date);
+    rows.push(paymentRow.join(','));
+
+    // 明細行
+    const detailRow = new Array(41).fill('');
+    detailRow[0] = '明細';
+    detailRow[20] = escapeCSV(inv.description ?? vendorName);
+    detailRow[21] = escapeCSV(accountItem);
+    detailRow[22] = escapeCSV(inv.tax_category);
+    detailRow[23] = escapeCSV(taxExcluded);
+    detailRow[24] = '1';
+    detailRow[25] = escapeCSV(taxExcluded);
+    detailRow[26] = escapeCSV(inv.tax_amount);
+    detailRow[28] = escapeCSV(inv.department);
+    detailRow[30] = escapeCSV(inv.sub_account);
+    detailRow[37] = 'JPY';
+    detailRow[38] = '1';
     rows.push(detailRow.join(','));
   }
 

@@ -10,20 +10,40 @@ interface TaskAnalysis {
   deadline_hint: string | null;
 }
 
+export type TaskCreatorResult = {
+  created: boolean;
+  taskTitle?: string;
+  task?: {
+    title: string;
+    deadline: string | null;
+    priority: 'high' | 'medium' | 'low';
+  };
+};
+
 const TASK_ANALYSIS_PROMPT = `あなたはビジネスメッセージからタスクを抽出する専門家です。
-以下のメッセージを分析し、受信者がアクションを取る必要があるタスクがあるか判断してください。
+以下のメッセージを分析し、受信者が具体的なアクションを取る必要があるタスクがあるか判断してください。
 
-タスクが必要な例:
-- 「○○を確認してください」「○○の対応お願いします」
-- 期限付きの依頼・リクエスト
-- 確認・承認が必要な内容
-- フォローアップが必要な内容
+■ 最重要ルール: タスク化するのは「社内メンバーや取引先から自分宛に届いた具体的な対応依頼」のみです。
+外部からの営業・勧誘・宣伝は、どれだけ魅力的でも needs_task: false にしてください。
 
-タスクが不要な例:
+■ タスクが必要な例（needs_task: true）:
+- 社内メンバーや既存取引先からの具体的な対応依頼（「○○を確認してください」「○○の対応お願いします」）
+- 明確な期限付きの作業依頼（「○日までに提出してください」）
+- 承認・確認・返答が必要な内容（「出欠を返信してください」「内容を確認の上ご連絡ください」）
+- 契約・支払い・行政手続きなど放置すると問題になる対応
+
+■ タスクが不要な例（needs_task: false）:
+- 広告メール・営業メール・DM（商品紹介、サービス提案、料金プラン案内）
+- メールマガジン・ニュースレター（Google Alerts、ニュース配信、業界情報）
+- セミナー・ウェビナー・イベントの勧誘・案内（参加募集、開催告知）
+- サービスの申込み勧誘・キャンペーン案内・無料トライアル案内
+- 求人・採用サービスからの自動案内メール
+- システム通知・自動通知・bot メッセージ（メンテナンス通知、ログイン通知）
 - 雑談、挨拶のみ
-- 情報共有・お知らせ（対応不要）
-- 自動通知・bot メッセージ
+- 情報共有・お知らせ（対応不要な報告・共有）
 - 既に完了済みの報告
+
+■ 判断に迷ったら needs_task: false にしてください。過剰なタスク化は業務を妨げます。
 
 JSON形式で返してください:
 {
@@ -40,7 +60,7 @@ export async function analyzeAndCreateTask(params: {
   subject?: string;
   text: string;
   channelOrThread?: string;
-}): Promise<{ created: boolean; taskTitle?: string }> {
+}): Promise<TaskCreatorResult> {
   if (isAutoTaskExists(params.source, params.sourceId)) {
     return { created: false };
   }
@@ -107,7 +127,15 @@ export async function analyzeAndCreateTask(params: {
       }
     }
 
-    return { created: true, taskTitle: analysis.task_title };
+    return {
+      created: true,
+      taskTitle: analysis.task_title,
+      task: {
+        title: firestoreTask.title,
+        deadline: firestoreTask.deadline ?? null,
+        priority: firestoreTask.priority ?? 'medium',
+      },
+    };
   } catch (err) {
     console.error('[task-creator] Firebase書き込みエラー:', err);
     return { created: false };

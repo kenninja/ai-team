@@ -2,8 +2,35 @@ import Database from 'better-sqlite3';
 import path from 'path';
 import { existsSync, mkdirSync } from 'fs';
 import { Message, Session } from '@/agents/types';
+import { normalizeAccountNumber } from './salary-csv';
+import { CompanyCode } from './salary-companies';
+import { PHASE_KEYS, type PhaseKey, type PropertyStatus } from '@/types/opening';
+import { OPENING_DOCUMENT_MASTER } from './opening-document-master';
 
 const DB_PATH = path.join(process.cwd(), 'data', 'ai-team.db');
+
+function insertOpeningDocumentsMaster(database: Database.Database, propertyId: number): void {
+  const ins = database.prepare(
+    `INSERT INTO opening_documents (property_id, category, doc_name, is_required, submitted, deadline_offset)
+     VALUES (?, ?, ?, ?, 0, ?)`,
+  );
+  for (const [category, docName, isRequired, deadlineOffset] of OPENING_DOCUMENT_MASTER) {
+    ins.run(propertyId, category, docName, isRequired, deadlineOffset);
+  }
+}
+
+function migrateAddOpeningDocumentsMaster(database: Database.Database): void {
+  const props = database.prepare('SELECT id FROM opening_properties').all() as { id: number }[];
+  const countStmt = database.prepare(
+    'SELECT COUNT(*) as cnt FROM opening_documents WHERE property_id = ?',
+  );
+  for (const p of props) {
+    const row = countStmt.get(p.id) as { cnt: number };
+    if (row.cnt === 0) {
+      insertOpeningDocumentsMaster(database, p.id);
+    }
+  }
+}
 
 let db: Database.Database | null = null;
 
@@ -91,7 +118,7 @@ function initTables(db: Database.Database) {
       sub_account TEXT,
       tax_category TEXT,
       department TEXT,
-      status TEXT DEFAULT 'draft',
+      status TEXT DEFAULT 'pending',
       created_at INTEGER DEFAULT (unixepoch()),
       updated_at INTEGER DEFAULT (unixepoch())
     );
@@ -128,6 +155,20 @@ function initTables(db: Database.Database) {
       PRIMARY KEY (channel_id, message_ts)
     );
 
+    -- MF支払先マスタ
+    CREATE TABLE IF NOT EXISTS mf_vendors (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      vendor_name TEXT NOT NULL,
+      vendor_name_short TEXT,
+      vendor_code TEXT,
+      vendor_unique_key TEXT,
+      default_account_item TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_mf_vendors_name ON mf_vendors(vendor_name);
+    CREATE INDEX IF NOT EXISTS idx_mf_vendors_short ON mf_vendors(vendor_name_short);
+
     -- 自動生成タスク追跡
     CREATE TABLE IF NOT EXISTS auto_tasks (
       id TEXT PRIMARY KEY,
@@ -137,7 +178,144 @@ function initTables(db: Database.Database) {
       firebase_synced INTEGER DEFAULT 0,
       created_at INTEGER DEFAULT (unixepoch())
     );
+
+    -- 出店管理: 物件
+    CREATE TABLE IF NOT EXISTS opening_properties (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      property_name TEXT NOT NULL,
+      area TEXT NOT NULL,
+      target_open_month TEXT,
+      rent INTEGER,
+      status TEXT DEFAULT 'candidate',
+      created_at TEXT DEFAULT (datetime('now', 'localtime')),
+      updated_at TEXT DEFAULT (datetime('now', 'localtime'))
+    );
+
+    -- 出店管理: フェーズ
+    CREATE TABLE IF NOT EXISTS opening_phases (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      property_id INTEGER NOT NULL,
+      phase_key TEXT NOT NULL,
+      completed INTEGER DEFAULT 0,
+      scheduled_date TEXT,
+      completed_date TEXT,
+      memo TEXT,
+      updated_at TEXT DEFAULT (datetime('now', 'localtime')),
+      UNIQUE(property_id, phase_key),
+      FOREIGN KEY (property_id) REFERENCES opening_properties(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_opening_phases_property ON opening_phases(property_id);
+
+    -- 出店管理: 認可書類（チェックリスト詳細は後続）
+    CREATE TABLE IF NOT EXISTS opening_documents (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      property_id INTEGER NOT NULL,
+      category TEXT NOT NULL,
+      doc_name TEXT NOT NULL,
+      is_required INTEGER DEFAULT 1,
+      submitted INTEGER DEFAULT 0,
+      deadline_offset TEXT,
+      memo TEXT,
+      FOREIGN KEY (property_id) REFERENCES opening_properties(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_opening_documents_property ON opening_documents(property_id);
   `);
+
+  // 給与支払 GMO 振込CSV 用 口座マスタ
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS employee_bank_accounts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      company TEXT NOT NULL DEFAULT 'gotoschool',
+      employee_no TEXT NOT NULL,
+      employee_name TEXT NOT NULL,
+      bank_name TEXT NOT NULL,
+      bank_code TEXT NOT NULL,
+      branch_code TEXT NOT NULL,
+      account_type TEXT DEFAULT '1',
+      account_number TEXT NOT NULL,
+      account_holder TEXT NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now')),
+      UNIQUE(account_number, company)
+    );
+  `);
+
+  // company 列と複合 UNIQUE(account_number, company) が揃っていない場合はテーブルを作り直す
+  try {
+    const tableInfo = db.prepare("PRAGMA table_info(employee_bank_accounts)").all() as Array<{ name: string }>;
+    const hasCompanyCol = tableInfo.some(c => c.name === 'company');
+    const indexList = db.prepare("PRAGMA index_list(employee_bank_accounts)").all() as Array<{ name: string; unique: number }>;
+
+    const hasCompositeUnique = indexList
+      .filter(i => i.unique === 1)
+      .some(i => {
+        const safeName = String(i.name).replace(/'/g, "''");
+        const idxCols = db.prepare(`PRAGMA index_info('${safeName}')`).all() as Array<{ name: string }>;
+        const colNames = idxCols.map(c => c.name);
+        return colNames.includes('account_number') && colNames.includes('company');
+      });
+
+    if (!hasCompanyCol || !hasCompositeUnique) {
+      // existing をコピーして作り直す（ALTER TABLE で UNIQUE を差し替えできないため）
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS employee_bank_accounts__v2 (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          company TEXT NOT NULL DEFAULT 'gotoschool',
+          employee_no TEXT NOT NULL,
+          employee_name TEXT NOT NULL,
+          bank_name TEXT NOT NULL,
+          bank_code TEXT NOT NULL,
+          branch_code TEXT NOT NULL,
+          account_type TEXT DEFAULT '1',
+          account_number TEXT NOT NULL,
+          account_holder TEXT NOT NULL,
+          created_at TEXT DEFAULT (datetime('now')),
+          updated_at TEXT DEFAULT (datetime('now')),
+          UNIQUE(account_number, company)
+        );
+      `);
+
+      if (hasCompanyCol) {
+        db.exec(`
+          INSERT OR IGNORE INTO employee_bank_accounts__v2 (
+            id, company, employee_no, employee_name, bank_name, bank_code, branch_code,
+            account_type, account_number, account_holder, created_at, updated_at
+          )
+          SELECT
+            id, company, employee_no, employee_name, bank_name, bank_code, branch_code,
+            account_type, account_number, account_holder, created_at, updated_at
+          FROM employee_bank_accounts;
+        `);
+      } else {
+        db.exec(`
+          INSERT OR IGNORE INTO employee_bank_accounts__v2 (
+            id, company, employee_no, employee_name, bank_name, bank_code, branch_code,
+            account_type, account_number, account_holder, created_at, updated_at
+          )
+          SELECT
+            id, 'gotoschool' as company, employee_no, employee_name, bank_name, bank_code, branch_code,
+            account_type, account_number, account_holder, created_at, updated_at
+          FROM employee_bank_accounts;
+        `);
+      }
+
+      db.exec(`
+        DROP TABLE employee_bank_accounts;
+        ALTER TABLE employee_bank_accounts__v2 RENAME TO employee_bank_accounts;
+      `);
+
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_employee_bank_accounts_company_employee_no
+          ON employee_bank_accounts(company, employee_no);
+        CREATE INDEX IF NOT EXISTS idx_employee_bank_accounts_company_account_number
+          ON employee_bank_accounts(company, account_number);
+      `);
+    }
+  } catch {
+    // migration 失敗しても app 起動自体は継続する（必要ならログ出し）
+  }
 
   // マイグレーション: mentioned_meカラム追加
   try {
@@ -148,6 +326,10 @@ function initTables(db: Database.Database) {
   try {
     db.prepare('ALTER TABLE auto_tasks ADD COLUMN calendar_event_id TEXT').run();
   } catch { /* カラムが既に存在する場合は無視 */ }
+
+  // マイグレーション: invoicesステータス統一 (draft/confirmed → pending/ready)
+  db.prepare("UPDATE invoices SET status = 'ready' WHERE status IN ('confirmed', 'draft')").run();
+  db.prepare("UPDATE invoices SET status = 'pending' WHERE status NOT IN ('ready', 'exported')").run();
 
   // デフォルトベンダーのシード
   const vendorCount = db.prepare('SELECT COUNT(*) as count FROM vendors').get() as { count: number };
@@ -160,6 +342,12 @@ function initTables(db: Database.Database) {
     insertVendor.run('東京電力', '水道光熱費', '電気代', '課税仕入10%', '管理部');
     insertVendor.run('東京ガス', '水道光熱費', 'ガス代', '課税仕入10%', '管理部');
     insertVendor.run('ヤマト運輸', '荷造運賃', '宅配便', '課税仕入10%', '営業部');
+  }
+
+  try {
+    migrateAddOpeningDocumentsMaster(db);
+  } catch {
+    /* 出店書類マイグレーション失敗時も起動は継続 */
   }
 }
 
@@ -317,6 +505,19 @@ export function markNoReplyNeeded(messageId: string) {
   db.prepare('UPDATE processed_emails SET needs_reply = 0 WHERE message_id = ?').run(messageId);
 }
 
+export function markAllUnrepliedAsNoReply(): number {
+  const db = getDb();
+  const result = db.prepare('UPDATE processed_emails SET needs_reply = 0 WHERE needs_reply = 1 AND reply_sent = 0').run();
+  return result.changes;
+}
+
+export function autoExpireOldUnreplied(daysOld: number = 7): number {
+  const db = getDb();
+  const cutoff = Math.floor(Date.now() / 1000) - (daysOld * 86400);
+  const result = db.prepare('UPDATE processed_emails SET needs_reply = 0 WHERE needs_reply = 1 AND reply_sent = 0 AND received_at < ?').run(cutoff);
+  return result.changes;
+}
+
 export function updateReplyDraft(messageId: string, draft: string) {
   const db = getDb();
   db.prepare('UPDATE processed_emails SET reply_draft = ? WHERE message_id = ?').run(draft, messageId);
@@ -376,6 +577,21 @@ export function markInvoicesExported(ids: number[]) {
   const db = getDb();
   const placeholders = ids.map(() => '?').join(',');
   db.prepare(`UPDATE invoices SET status = 'exported', updated_at = unixepoch() WHERE id IN (${placeholders})`).run(...ids);
+}
+
+export function deleteInvoice(id: number) {
+  const db = getDb();
+  db.prepare('DELETE FROM invoices WHERE id = ?').run(id);
+}
+
+export function getInvoicesDueSoon(dates: string[]) {
+  const db = getDb();
+  const placeholders = dates.map(() => '?').join(',');
+  return db.prepare(
+    `SELECT id, vendor_name, total_amount, due_date, status FROM invoices
+     WHERE due_date IN (${placeholders}) AND status NOT IN ('exported')
+     ORDER BY due_date`
+  ).all(...dates) as { id: number; vendor_name: string | null; total_amount: number | null; due_date: string; status: string }[];
 }
 
 // --- Vendors ---
@@ -471,13 +687,64 @@ export function updateAutoTaskCalendarId(taskId: string, calendarEventId: string
   db.prepare('UPDATE auto_tasks SET calendar_event_id = ? WHERE id = ?').run(calendarEventId, taskId);
 }
 
+// --- MF Vendors ---
+
+export function clearMFVendors() {
+  const db = getDb();
+  db.prepare('DELETE FROM mf_vendors').run();
+}
+
+export function insertMFVendor(data: {
+  vendorName: string; vendorNameShort: string; vendorCode: string;
+  vendorUniqueKey: string; defaultAccountItem: string;
+}) {
+  const db = getDb();
+  db.prepare(`
+    INSERT INTO mf_vendors (vendor_name, vendor_name_short, vendor_code, vendor_unique_key, default_account_item)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(data.vendorName, data.vendorNameShort, data.vendorCode, data.vendorUniqueKey, data.defaultAccountItem);
+}
+
+export type MFVendorRow = {
+  id: number; vendor_name: string; vendor_name_short: string | null;
+  vendor_code: string | null; vendor_unique_key: string | null;
+  default_account_item: string | null;
+};
+
+export function findMFVendorByName(name: string): MFVendorRow | null {
+  if (!name) return null;
+  const db = getDb();
+
+  // 1. 完全一致（取引先名）
+  let row = db.prepare('SELECT * FROM mf_vendors WHERE vendor_name = ? LIMIT 1').get(name) as MFVendorRow | undefined;
+  if (row) return row;
+
+  // 2. 完全一致（支払先名・略称）
+  row = db.prepare('SELECT * FROM mf_vendors WHERE vendor_name_short = ? LIMIT 1').get(name) as MFVendorRow | undefined;
+  if (row) return row;
+
+  // 3. 部分一致（双方向）
+  row = db.prepare(
+    "SELECT * FROM mf_vendors WHERE ? LIKE '%' || vendor_name || '%' OR vendor_name LIKE '%' || ? || '%' OR ? LIKE '%' || vendor_name_short || '%' OR vendor_name_short LIKE '%' || ? || '%' LIMIT 1"
+  ).get(name, name, name, name) as MFVendorRow | undefined;
+  if (row) return row;
+
+  return null;
+}
+
+export function getMFVendorCount(): number {
+  const db = getDb();
+  const row = db.prepare('SELECT COUNT(*) as count FROM mf_vendors').get() as { count: number };
+  return row.count;
+}
+
 // --- Summary (日次サマリー用) ---
 
 export function getUnrepliedEmails() {
   const db = getDb();
   return db.prepare(
     'SELECT * FROM processed_emails WHERE needs_reply = 1 AND reply_sent = 0 ORDER BY received_at DESC'
-  ).all() as { subject: string; sender: string; reply_urgency: string; received_at: number }[];
+  ).all() as { message_id: string; subject: string; sender: string; reply_urgency: string; received_at: number; reply_draft: string | null }[];
 }
 
 export function getUnrepliedSlackMessages() {
@@ -485,4 +752,379 @@ export function getUnrepliedSlackMessages() {
   return db.prepare(
     'SELECT * FROM slack_messages WHERE needs_reply = 1 AND reply_sent = 0 ORDER BY processed_at DESC'
   ).all() as { channel_name: string; user_name: string; text: string; reply_urgency: string }[];
+}
+
+// --- Salary Convert (給与 GMO 振込 CSV) ---
+
+export type EmployeeBankAccountRow = {
+  id: number;
+  company: string;
+  employee_no: string;
+  employee_name: string;
+  bank_name: string;
+  bank_code: string;
+  branch_code: string;
+  account_type: string;
+  account_number: string;
+  account_holder: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export function insertEmployeeBankAccounts(accounts: Array<{
+  employee_no: string;
+  employee_name: string;
+  bank_name: string;
+  bank_code: string;
+  branch_code: string;
+  account_type: string;
+  account_number: string;
+  account_holder: string;
+}>, company: CompanyCode): { inserted: number } {
+  if (accounts.length === 0) return { inserted: 0 };
+
+  const db = getDb();
+  const stmt = db.prepare(`
+    INSERT OR IGNORE INTO employee_bank_accounts (
+      company, employee_no, employee_name, bank_name, bank_code, branch_code,
+      account_type, account_number, account_holder
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  let inserted = 0;
+  for (const a of accounts) {
+    inserted += stmt.run(
+      company,
+      a.employee_no,
+      a.employee_name,
+      a.bank_name,
+      a.bank_code,
+      a.branch_code,
+      a.account_type,
+      normalizeAccountNumber(a.account_number),
+      a.account_holder
+    ).changes;
+  }
+
+  return { inserted };
+}
+
+export function getEmployeeBankAccountsByAccountNumbers(accountNumbers: string[], company: CompanyCode): EmployeeBankAccountRow[] {
+  if (accountNumbers.length === 0) return [];
+  const db = getDb();
+
+  const normalizedInputs = Array.from(
+    new Set(accountNumbers.map(a => normalizeAccountNumber(a)).filter(Boolean)),
+  );
+  const unnormalizedInputs = normalizedInputs.map(n => n.replace(/^0+/, ''));
+  const candidates = Array.from(new Set([...normalizedInputs, ...unnormalizedInputs])).filter(Boolean);
+
+  const placeholders = candidates.map(() => '?').join(',');
+  const sql = `
+    SELECT id,
+      company,
+      employee_no, employee_name,
+      bank_name, bank_code, branch_code,
+      account_type, account_number, account_holder,
+      created_at, updated_at
+    FROM employee_bank_accounts
+    WHERE company = ? AND account_number IN (${placeholders})
+  `;
+
+  const rows = db.prepare(sql).all(company, ...candidates) as EmployeeBankAccountRow[];
+  return rows.map(r => ({ ...r, account_number: normalizeAccountNumber(r.account_number) }));
+}
+
+export function getAllEmployeeBankAccounts(company: CompanyCode): EmployeeBankAccountRow[] {
+  const db = getDb();
+  const rows = db.prepare(`
+    SELECT id,
+      company,
+      employee_no, employee_name,
+      bank_name, bank_code, branch_code,
+      account_type, account_number, account_holder,
+      created_at, updated_at
+    FROM employee_bank_accounts
+    WHERE company = ?
+    ORDER BY employee_no ASC
+  `).all(company) as EmployeeBankAccountRow[];
+
+  return rows.map(r => ({ ...r, account_number: normalizeAccountNumber(r.account_number) }));
+}
+
+export function upsertEmployeeBankAccounts(accounts: Array<{
+  employee_no: string;
+  employee_name: string;
+  bank_name: string;
+  bank_code: string;
+  branch_code: string;
+  account_type: string;
+  account_number: string;
+  account_holder: string;
+}>, company: CompanyCode): { inserted: number; updated: number } {
+  if (accounts.length === 0) return { inserted: 0, updated: 0 };
+
+  const db = getDb();
+
+  const normalizedAccounts = accounts
+    .map(a => ({ ...a, account_number: normalizeAccountNumber(a.account_number) }))
+    .filter(a => a.account_number);
+
+  const normalizedInputs = Array.from(new Set(normalizedAccounts.map(a => a.account_number))).filter(Boolean);
+  const unnormalizedInputs = normalizedInputs.map(n => n.replace(/^0+/, ''));
+  const candidates = Array.from(new Set([...normalizedInputs, ...unnormalizedInputs])).filter(Boolean);
+
+  const placeholders = candidates.map(() => '?').join(',');
+
+  // 既存判定（口座番号で分岐）: inserted/updated数を正確に出すため
+  const existingRows = db.prepare(
+    `SELECT account_number FROM employee_bank_accounts WHERE company = ? AND account_number IN (${placeholders})`
+  ).all(company, ...candidates) as Array<{ account_number: string }>;
+  const existingSet = new Set(existingRows.map(r => normalizeAccountNumber(r.account_number)));
+
+  const accountNumberMap = new Map<string, string>(); // normalized -> actual account_number in DB
+  for (const r of existingRows) {
+    accountNumberMap.set(normalizeAccountNumber(r.account_number), r.account_number);
+  }
+
+  const insertStmt = db.prepare(`
+    INSERT INTO employee_bank_accounts (
+      company, employee_no, employee_name, bank_name, bank_code, branch_code,
+      account_type, account_number, account_holder
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const updateStmt = db.prepare(`
+    UPDATE employee_bank_accounts
+    SET employee_no = ?, employee_name = ?, bank_name = ?, bank_code = ?, branch_code = ?,
+        account_type = ?, account_holder = ?, account_number = ?, updated_at = datetime('now')
+    WHERE company = ? AND account_number = ?
+  `);
+
+  const tx = db.transaction(() => {
+    let inserted = 0;
+    let updated = 0;
+
+    for (const a of normalizedAccounts) {
+      const normalized = a.account_number;
+      const existingActual = accountNumberMap.get(normalized);
+      if (existingSet.has(normalized) && existingActual) {
+        updateStmt.run(
+          a.employee_no,
+          a.employee_name,
+          a.bank_name,
+          a.bank_code,
+          a.branch_code,
+          a.account_type,
+          a.account_holder,
+          normalized,
+          company,
+          existingActual
+        );
+        updated++;
+      } else {
+        insertStmt.run(
+          company,
+          a.employee_no,
+          a.employee_name,
+          a.bank_name,
+          a.bank_code,
+          a.branch_code,
+          a.account_type,
+          a.account_number,
+          a.account_holder
+        );
+        inserted++;
+      }
+    }
+
+    return { inserted, updated };
+  });
+
+  return tx();
+}
+
+// --- Opening (出店管理) ---
+
+export type OpeningPropertyRow = {
+  id: number;
+  property_name: string;
+  area: string;
+  target_open_month: string | null;
+  rent: number | null;
+  status: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type OpeningPhaseRow = {
+  id: number;
+  property_id: number;
+  phase_key: string;
+  completed: number;
+  scheduled_date: string | null;
+  completed_date: string | null;
+  memo: string | null;
+  updated_at: string;
+};
+
+const phaseKeyOrder = new Map(PHASE_KEYS.map((p, i) => [p.key, i]));
+
+export function listOpeningPropertiesWithDetails() {
+  const db = getDb();
+  const props = db
+    .prepare(
+      `SELECT * FROM opening_properties
+       ORDER BY target_open_month IS NULL, target_open_month ASC, id ASC`,
+    )
+    .all() as OpeningPropertyRow[];
+
+  const phaseStmt = db.prepare('SELECT * FROM opening_phases WHERE property_id = ?');
+  const docStmt = db.prepare(
+    `SELECT
+       COUNT(*) as total,
+       COALESCE(SUM(CASE WHEN submitted = 1 THEN 1 ELSE 0 END), 0) as submitted
+     FROM opening_documents WHERE property_id = ?`,
+  );
+
+  return props.map((p) => {
+    const phases = phaseStmt.all(p.id) as OpeningPhaseRow[];
+    phases.sort((a, b) => (phaseKeyOrder.get(a.phase_key as (typeof PHASE_KEYS)[number]['key']) ?? 99) - (phaseKeyOrder.get(b.phase_key as (typeof PHASE_KEYS)[number]['key']) ?? 99));
+    const docRow = docStmt.get(p.id) as { total: number; submitted: number };
+    return {
+      id: p.id,
+      property_name: p.property_name,
+      area: p.area,
+      target_open_month: p.target_open_month,
+      rent: p.rent,
+      status: p.status as PropertyStatus,
+      created_at: p.created_at,
+      updated_at: p.updated_at,
+      phases: phases.map((ph) => ({
+        id: ph.id,
+        property_id: ph.property_id,
+        phase_key: ph.phase_key as PhaseKey,
+        completed: ph.completed === 1,
+        scheduled_date: ph.scheduled_date,
+        completed_date: ph.completed_date,
+        memo: ph.memo,
+      })),
+      doc_progress: { total: docRow.total, submitted: docRow.submitted },
+    };
+  });
+}
+
+const VALID_OPENING_STATUSES: PropertyStatus[] = [
+  'candidate',
+  'viewing',
+  'applied',
+  'contracted',
+  'construction',
+  'ready',
+  'active',
+  'dropped',
+];
+
+export function createOpeningProperty(data: {
+  property_name: string;
+  area: string;
+  target_open_month: string | null;
+  rent: number | null;
+  status: string;
+}): number {
+  const db = getDb();
+  const status = VALID_OPENING_STATUSES.includes(data.status as PropertyStatus)
+    ? data.status
+    : 'candidate';
+
+  const tx = db.transaction(() => {
+    const r = db
+      .prepare(
+        `INSERT INTO opening_properties (property_name, area, target_open_month, rent, status)
+         VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(data.property_name, data.area, data.target_open_month, data.rent, status);
+    const propertyId = Number(r.lastInsertRowid);
+    const insPhase = db.prepare(
+      `INSERT INTO opening_phases (property_id, phase_key) VALUES (?, ?)`,
+    );
+    for (const { key } of PHASE_KEYS) {
+      insPhase.run(propertyId, key);
+    }
+    insertOpeningDocumentsMaster(db, propertyId);
+    return propertyId;
+  });
+
+  return tx();
+}
+
+export function updateOpeningPhaseCompleted(
+  propertyId: number,
+  phaseKey: string,
+  completed: boolean,
+) {
+  const db = getDb();
+  const completedDate = completed ? new Date().toISOString().slice(0, 10) : null;
+  db.prepare(
+    `UPDATE opening_phases
+     SET completed = ?, completed_date = ?, updated_at = datetime('now', 'localtime')
+     WHERE property_id = ? AND phase_key = ?`,
+  ).run(completed ? 1 : 0, completedDate, propertyId, phaseKey);
+}
+
+export function deleteOpeningProperty(id: number): boolean {
+  const db = getDb();
+  const r = db.prepare('DELETE FROM opening_properties WHERE id = ?').run(id);
+  return r.changes > 0;
+}
+
+export type OpeningDocumentRow = {
+  id: number;
+  property_id: number;
+  category: string;
+  doc_name: string;
+  is_required: number;
+  submitted: number;
+  deadline_offset: string | null;
+  memo: string | null;
+};
+
+export function getOpeningPropertyMeta(
+  propertyId: number,
+): { id: number; property_name: string } | null {
+  const db = getDb();
+  const row = db
+    .prepare('SELECT id, property_name FROM opening_properties WHERE id = ?')
+    .get(propertyId) as { id: number; property_name: string } | undefined;
+  return row ?? null;
+}
+
+export function listOpeningDocumentsForProperty(propertyId: number): OpeningDocumentRow[] {
+  const db = getDb();
+  return db
+    .prepare(
+      'SELECT * FROM opening_documents WHERE property_id = ? ORDER BY category, id',
+    )
+    .all(propertyId) as OpeningDocumentRow[];
+}
+
+export function updateOpeningDocument(
+  propertyId: number,
+  documentId: number,
+  data: { submitted: boolean; memo?: string | null },
+): boolean {
+  const db = getDb();
+  if (data.memo !== undefined) {
+    const r = db
+      .prepare(
+        `UPDATE opening_documents SET submitted = ?, memo = ? WHERE id = ? AND property_id = ?`,
+      )
+      .run(data.submitted ? 1 : 0, data.memo, documentId, propertyId);
+    return r.changes > 0;
+  }
+  const r = db
+    .prepare(
+      `UPDATE opening_documents SET submitted = ? WHERE id = ? AND property_id = ?`,
+    )
+    .run(data.submitted ? 1 : 0, documentId, propertyId);
+  return r.changes > 0;
 }

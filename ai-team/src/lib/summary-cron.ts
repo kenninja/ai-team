@@ -69,6 +69,7 @@ export async function sendDailySummary(): Promise<boolean> {
         if (!b.deadline) return -1;
         return a.deadline.localeCompare(b.deadline);
       });
+    const todayDueTasks = pendingTasks.filter(t => t.deadline === today);
 
     // 何もなければ短いメッセージ
     if (unrepliedEmails.length === 0 && unrepliedSlack.length === 0 && pendingTasks.length === 0) {
@@ -108,6 +109,21 @@ export async function sendDailySummary(): Promise<boolean> {
     }
 
     // タスク
+    lines.push(`━━ 今日のTODO (${todayDueTasks.length}件) ━━`);
+    if (todayDueTasks.length === 0) {
+      lines.push('✅ 今日期限のタスクはありません');
+    } else {
+      for (const task of todayDueTasks.slice(0, 10)) {
+        const icon = task.priority === 'high' ? '🔴' : task.priority === 'medium' ? '🟡' : '⚪';
+        lines.push(`${icon} ${task.title}`);
+      }
+      if (todayDueTasks.length > 10) {
+        lines.push(`   ...他 ${todayDueTasks.length - 10}件`);
+      }
+    }
+    lines.push('');
+
+    // タスク（未完了全体）
     if (pendingTasks.length > 0) {
       lines.push(`━━ タスク (${pendingTasks.length}件) ━━`);
       for (const task of pendingTasks.slice(0, 10)) {

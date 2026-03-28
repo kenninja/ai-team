@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getInvoice, markInvoicesExported } from '@/lib/db';
-import { generateSimpleCSV, generateMFSpotCSV, generateMFRegisteredCSV } from '@/lib/csv-export';
+import { generateSimpleCSV, generateMFSpotCSV, generateMFRegisteredCSV, generateMFAutoCSV } from '@/lib/csv-export';
 
 export async function POST(request: NextRequest) {
   const body = await request.json();
@@ -10,8 +10,8 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: 'idsが必要です' }, { status: 400 });
   }
 
-  if (!format || !['simple', 'mf_spot', 'mf_registered'].includes(format)) {
-    return NextResponse.json({ error: 'format は simple, mf_spot, mf_registered のいずれかです' }, { status: 400 });
+  if (!format || !['simple', 'mf_spot', 'mf_registered', 'mf_auto'].includes(format)) {
+    return NextResponse.json({ error: 'format は simple, mf_spot, mf_registered, mf_auto のいずれかです' }, { status: 400 });
   }
 
   // 請求書データを取得
@@ -38,6 +38,10 @@ export async function POST(request: NextRequest) {
     case 'mf_registered':
       csv = generateMFRegisteredCSV(invoices);
       filename = `invoices_mf_registered_${dateStr}.csv`;
+      break;
+    case 'mf_auto':
+      csv = generateMFAutoCSV(invoices);
+      filename = `invoices_mf_auto_${dateStr}.csv`;
       break;
     default:
       return NextResponse.json({ error: '不明なフォーマット' }, { status: 400 });

@@ -22,7 +22,25 @@ export function startMailCron() {
     await sendUnrepliedReminders();
   });
 
-  console.log('[mail-cron] スケジュール登録完了: 5分ごとチェック + 毎時リマインダー');
+  // Gmail 分類（未読・過去24h）: 毎朝 9:00 JST
+  cron.schedule(
+    '0 9 * * *',
+    async () => {
+      try {
+        const { runGmailClassifyJob } = await import('./gmail-classify');
+        console.log('[mail-cron] Gmail分類ジョブ開始');
+        const r = await runGmailClassifyJob();
+        console.log(
+          `[mail-cron] Gmail分類完了 fetched=${r.fetched} classified=${r.classified} tasks=${r.tasksCreated} slack=${r.slackAlerts}`,
+        );
+      } catch (e) {
+        console.error('[mail-cron] Gmail分類ジョブエラー:', e);
+      }
+    },
+    { timezone: 'Asia/Tokyo' },
+  );
+
+  console.log('[mail-cron] スケジュール登録完了: 5分ごとチェック + 毎時リマインダー + 毎朝9時Gmail分類');
 }
 
 /**
@@ -52,9 +70,9 @@ async function processNewEmails() {
     if (!isGmailConnected()) return;
 
     const { fetchEmails } = await import('./gmail');
-    const { isEmailProcessed, saveProcessedEmail, createInvoice, findVendorByName } = await import('./db');
-    const { generateText } = await import('./gemini');
-    const { extractJson } = await import('./json-extract');
+    const { isEmailProcessed, saveProcessedEmail, createInvoice } = await import('./db');
+    const { claudeHaikuGenerateText } = await import('./claude-haiku');
+    const { extractJsonLenient } = await import('./json-extract');
     const { waitForRateLimit } = await import('./rate-limiter');
 
     // 直近のメールを取得
@@ -85,24 +103,49 @@ async function processNewEmails() {
 注意:
 - 広告、ニュースレター、自動通知メールには返信不要です
 - 請求書の判定は添付ファイル名に"請求","invoice","bill"が含まれるか、PDFファイルの添付があるかで判断
-- 返信ドラフトはビジネスにふさわしい丁寧な日本語で作成してください`;
+- 返信ドラフトはビジネスにふさわしい丁寧な日本語で作成してください
+- needs_reply が true のときは reply_draft に必ず返信案の文字列を入れること（null や空文字にしないこと）`;
 
         const attachmentNames = detail.attachments.map(a => a.filename).join(', ');
         const input = `件名: ${detail.subject}\n差出人: ${detail.from} <${detail.fromEmail}>\n添付: ${attachmentNames || 'なし'}\n\n本文:\n${detail.bodyText || '(なし)'}`;
 
         await waitForRateLimit();
-        const analysisResponse = await generateText(analysisPrompt, input);
-        let analysis: { needs_reply: boolean; reply_urgency: string; reply_draft: string; has_invoice: boolean; summary: string };
+        const analysisResponse = await claudeHaikuGenerateText(analysisPrompt, input);
+        type MailAnalysis = {
+          needs_reply: boolean;
+          reply_urgency: string;
+          reply_draft: string;
+          has_invoice: boolean;
+          summary: string;
+        };
+        let analysis: MailAnalysis;
         try {
-          analysis = extractJson(analysisResponse);
+          const raw = extractJsonLenient<Record<string, unknown>>(analysisResponse);
+          const draftRaw = raw.reply_draft;
+          const draftStr =
+            draftRaw === null || draftRaw === undefined
+              ? ''
+              : String(draftRaw).trim();
+          analysis = {
+            needs_reply: Boolean(raw.needs_reply),
+            reply_urgency: typeof raw.reply_urgency === 'string' ? raw.reply_urgency : 'none',
+            reply_draft: draftStr,
+            has_invoice: Boolean(raw.has_invoice),
+            summary: typeof raw.summary === 'string' ? raw.summary : '',
+          };
         } catch {
-          analysis = { needs_reply: false, reply_urgency: 'none', reply_draft: '', has_invoice: false, summary: '分析失敗' };
+          analysis = {
+            needs_reply: false,
+            reply_urgency: 'none',
+            reply_draft: '',
+            has_invoice: false,
+            summary: '分析失敗',
+          };
         }
 
-        // 請求書処理
+        // 請求書処理（ファイル保存のみ、手入力で後から詳細を埋める）
         let invoiceId: number | undefined;
         if (analysis.has_invoice) {
-          const { ocrInvoice } = await import('./invoice-ocr');
           const invoiceAttachments = detail.attachments.filter(a => /\.(pdf|jpg|jpeg|png)$/i.test(a.filename));
 
           for (const att of invoiceAttachments) {
@@ -120,27 +163,13 @@ async function processNewEmails() {
               const fileName = `${uuidv4()}${ext}`;
               await writeFile(path.join(uploadDir, fileName), fileBuffer);
 
-              const ocrData = await ocrInvoice(fileBuffer, att.mimeType);
-              const vendor = ocrData.vendor_name ? findVendorByName(ocrData.vendor_name) : undefined;
-
               invoiceId = createInvoice({
                 emailMessageId: email.messageId,
                 filePath: `/uploads/${fileName}`,
-                vendorName: ocrData.vendor_name || undefined,
-                invoiceDate: ocrData.invoice_date || undefined,
-                dueDate: ocrData.due_date || undefined,
-                totalAmount: ocrData.total_amount || undefined,
-                taxAmount: ocrData.tax_amount || undefined,
-                taxRate: ocrData.tax_rate || undefined,
-                description: ocrData.description || undefined,
-                invoiceNumber: ocrData.invoice_number || undefined,
-                accountTitle: vendor?.account_title || undefined,
-                subAccount: vendor?.sub_account || undefined,
-                taxCategory: vendor?.tax_category || undefined,
-                department: vendor?.department || undefined,
+                description: `${detail.from}からの請求書 (${att.filename})`,
               });
             } catch (err) {
-              console.error('[mail-cron] OCRエラー:', err);
+              console.error('[mail-cron] 請求書保存エラー:', err);
             }
           }
         }
@@ -187,42 +216,51 @@ async function processNewEmails() {
         if (analysis.needs_reply) {
           const icon = analysis.reply_urgency === 'high' ? '🔴' : analysis.reply_urgency === 'medium' ? '🟡' : '🟢';
           const fallback = `📬 ${detail.from}「${detail.subject}」`;
+          const draft = analysis.reply_draft.trim();
           const blocks: unknown[] = [
             {
               type: 'section',
               text: { type: 'mrkdwn', text: `📬 *新着メール（要返信）*\n${icon} *${detail.from}*「${detail.subject}」\n📝 ${analysis.summary}` },
             },
           ];
-          if (analysis.reply_draft) {
+          if (draft) {
             blocks.push({
               type: 'section',
-              text: { type: 'mrkdwn', text: `✏️ *AI返信案：*\n${analysis.reply_draft}` },
-            });
-            blocks.push({
-              type: 'actions',
-              elements: [
-                {
-                  type: 'button',
-                  text: { type: 'plain_text', text: '✅ このまま送信' },
-                  style: 'primary',
-                  action_id: 'mail_reply_send',
-                  value: JSON.stringify({ messageId: email.messageId, draft: analysis.reply_draft }),
-                },
-                {
-                  type: 'button',
-                  text: { type: 'plain_text', text: '✏️ 編集して送信' },
-                  action_id: 'mail_reply_edit',
-                  value: JSON.stringify({ messageId: email.messageId, draft: analysis.reply_draft, subject: detail.subject, from: detail.from }),
-                },
-                {
-                  type: 'button',
-                  text: { type: 'plain_text', text: '🚫 返信不要' },
-                  action_id: 'mail_no_reply',
-                  value: JSON.stringify({ messageId: email.messageId, subject: detail.subject }),
-                },
-              ],
+              text: { type: 'mrkdwn', text: `✏️ *AI返信案：*\n${draft}` },
             });
           }
+          // Claude 等で reply_draft が空でも、編集・返信不要は出す（このまま送信は下書きがあるときのみ）
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const elements: any[] = [];
+          if (draft) {
+            elements.push({
+              type: 'button',
+              text: { type: 'plain_text', text: '✅ このまま送信' },
+              style: 'primary',
+              action_id: 'mail_reply_send',
+              value: JSON.stringify({ messageId: email.messageId, draft }),
+            });
+          }
+          elements.push(
+            {
+              type: 'button',
+              text: { type: 'plain_text', text: '✏️ 編集して送信' },
+              action_id: 'mail_reply_edit',
+              value: JSON.stringify({
+                messageId: email.messageId,
+                draft,
+                subject: detail.subject,
+                from: detail.from,
+              }),
+            },
+            {
+              type: 'button',
+              text: { type: 'plain_text', text: '🚫 返信不要' },
+              action_id: 'mail_no_reply',
+              value: JSON.stringify({ messageId: email.messageId, subject: detail.subject }),
+            },
+          );
+          blocks.push({ type: 'actions', elements });
           blocks.push({ type: 'divider' });
           await notifySlackDM(fallback, blocks);
         }
@@ -244,10 +282,15 @@ async function processNewEmails() {
  */
 async function sendUnrepliedReminders() {
   try {
-    const { getUnrepliedEmails } = await import('./db');
-    const unreplied = getUnrepliedEmails() as {
-      subject: string; sender: string; reply_urgency: string; received_at: number; reply_draft: string | null;
-    }[];
+    const { getUnrepliedEmails, autoExpireOldUnreplied } = await import('./db');
+
+    // 7日以上経過した未返信メールを自動クリア
+    const expired = autoExpireOldUnreplied(7);
+    if (expired > 0) {
+      console.log(`[mail-cron] ${expired}件の古い未返信メールを自動クリア`);
+    }
+
+    const unreplied = getUnrepliedEmails();
 
     if (unreplied.length === 0) return;
 
@@ -258,21 +301,75 @@ async function sendUnrepliedReminders() {
     const overdue = unreplied.filter(e => (now - e.received_at) >= twoHours);
     if (overdue.length === 0) return;
 
-    const lines = [`⏰ 未返信リマインド (${overdue.length}件)`];
-    for (const email of overdue.slice(0, 5)) {
-      const icon = email.reply_urgency === 'high' ? '🔴' : email.reply_urgency === 'medium' ? '🟡' : '🟢';
-      const hours = Math.floor((now - email.received_at) / 3600);
-      lines.push(`${icon} *${email.sender}*「${email.subject}」(${hours}時間経過)`);
-      if (email.reply_draft) {
-        lines.push(`   ✏️ AI返信案：${email.reply_draft}`);
-      }
-    }
-    if (overdue.length > 5) {
-      lines.push(`   ...他 ${overdue.length - 5}件`);
-    }
-    lines.push(`\n─────────────────`);
+    // Block Kit形式でボタン付きリマインドを送信
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const blocks: any[] = [
+      { type: 'section', text: { type: 'mrkdwn', text: `⏰ *未返信リマインド (${overdue.length}件)*` } },
+      { type: 'divider' },
+    ];
 
-    await notifySlackDM(lines.join('\n'));
+    for (const email of overdue.slice(0, 10)) {
+      const icon = email.reply_urgency === 'high' ? '🔴' : email.reply_urgency === 'medium' ? '🟡' : '🟢';
+      const elapsed = now - email.received_at;
+      const days = Math.floor(elapsed / 86400);
+      const hours = Math.floor(elapsed / 3600);
+      const timeStr = days > 0 ? `${days}日超過` : `${hours}時間経過`;
+
+      let text = `${icon} *${email.sender}*\n「${email.subject}」(${timeStr})`;
+      if (email.reply_draft) {
+        text += `\n✏️ AI返信案：${email.reply_draft}`;
+      }
+
+      blocks.push({
+        type: 'section',
+        text: { type: 'mrkdwn', text },
+      });
+      blocks.push({
+        type: 'actions',
+        elements: [
+          {
+            type: 'button',
+            text: { type: 'plain_text', text: '✅ 対応済み' },
+            action_id: 'reminder_mark_replied',
+            value: JSON.stringify({ messageId: email.message_id, subject: email.subject }),
+            style: 'primary',
+          },
+          {
+            type: 'button',
+            text: { type: 'plain_text', text: '🚫 返信不要' },
+            action_id: 'reminder_no_reply',
+            value: JSON.stringify({ messageId: email.message_id, subject: email.subject }),
+          },
+        ],
+      });
+    }
+
+    if (overdue.length > 10) {
+      blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `...他 ${overdue.length - 10}件` } });
+    }
+
+    // 一括クリアボタン
+    blocks.push({ type: 'divider' });
+    blocks.push({
+      type: 'actions',
+      elements: [
+        {
+          type: 'button',
+          text: { type: 'plain_text', text: '🗑️ 全件クリア' },
+          action_id: 'reminder_clear_all',
+          style: 'danger',
+          confirm: {
+            title: { type: 'plain_text', text: '確認' },
+            text: { type: 'mrkdwn', text: `未返信 ${overdue.length}件 を全てクリアしますか？` },
+            confirm: { type: 'plain_text', text: 'クリア' },
+            deny: { type: 'plain_text', text: 'キャンセル' },
+          },
+        },
+      ],
+    });
+
+    const fallback = `⏰ 未返信リマインド (${overdue.length}件)`;
+    await notifySlackDM(fallback, blocks);
     console.log(`[mail-cron] リマインダー送信: ${overdue.length}件`);
   } catch (err) {
     console.error('[mail-cron] リマインダーエラー:', err);

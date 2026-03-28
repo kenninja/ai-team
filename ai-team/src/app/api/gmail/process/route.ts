@@ -1,9 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { fetchEmailDetail, downloadAttachment, addLabel } from '@/lib/gmail';
 import { generateText } from '@/lib/gemini';
-import { ocrInvoice } from '@/lib/invoice-ocr';
 import { extractJson } from '@/lib/json-extract';
-import { saveProcessedEmail, isEmailProcessed, createInvoice, findVendorByName } from '@/lib/db';
+import { saveProcessedEmail, isEmailProcessed, createInvoice } from '@/lib/db';
 import { writeFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import path from 'path';
@@ -84,7 +83,7 @@ ${email.bodyText || '(テキスト本文なし)'}`;
         };
       }
 
-      // 請求書添付がある場合、OCR処理
+      // 請求書添付がある場合、ファイルを保存し下書き請求書を作成
       let invoiceId: number | undefined;
       if (analysis.has_invoice) {
         const invoiceAttachments = email.attachments.filter(a =>
@@ -93,10 +92,8 @@ ${email.bodyText || '(テキスト本文なし)'}`;
 
         for (const att of invoiceAttachments) {
           try {
-            // 添付ファイルをダウンロード
             const fileBuffer = await downloadAttachment(messageId, att.attachmentId);
 
-            // ファイルを保存
             const uploadDir = path.join(process.cwd(), 'public', 'uploads');
             if (!existsSync(uploadDir)) {
               await mkdir(uploadDir, { recursive: true });
@@ -106,47 +103,14 @@ ${email.bodyText || '(テキスト本文なし)'}`;
             const filePath = path.join(uploadDir, fileName);
             await writeFile(filePath, fileBuffer);
 
-            // OCR処理
-            const ocrData = await ocrInvoice(fileBuffer, att.mimeType);
-
-            // ベンダーマッチング
-            let accountInfo = {
-              accountTitle: null as string | null,
-              subAccount: null as string | null,
-              taxCategory: null as string | null,
-              department: null as string | null,
-            };
-            if (ocrData.vendor_name) {
-              const vendor = findVendorByName(ocrData.vendor_name);
-              if (vendor) {
-                accountInfo = {
-                  accountTitle: vendor.account_title,
-                  subAccount: vendor.sub_account,
-                  taxCategory: vendor.tax_category,
-                  department: vendor.department,
-                };
-              }
-            }
-
-            // DB保存
+            // 請求書レコードを作成（手入力で後から詳細を埋める）
             invoiceId = createInvoice({
               emailMessageId: messageId,
               filePath: `/uploads/${fileName}`,
-              vendorName: ocrData.vendor_name || undefined,
-              invoiceDate: ocrData.invoice_date || undefined,
-              dueDate: ocrData.due_date || undefined,
-              totalAmount: ocrData.total_amount || undefined,
-              taxAmount: ocrData.tax_amount || undefined,
-              taxRate: ocrData.tax_rate || undefined,
-              description: ocrData.description || undefined,
-              invoiceNumber: ocrData.invoice_number || undefined,
-              accountTitle: accountInfo.accountTitle || undefined,
-              subAccount: accountInfo.subAccount || undefined,
-              taxCategory: accountInfo.taxCategory || undefined,
-              department: accountInfo.department || undefined,
+              description: `${email.from}からの請求書 (${att.filename})`,
             });
           } catch (err) {
-            console.error('Invoice OCR error:', err);
+            console.error('Invoice save error:', err);
           }
         }
       }

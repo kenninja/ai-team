@@ -13,5 +13,9 @@ export async function register() {
     // 日次サマリー通知
     const { startSummaryCron } = await import('./lib/summary-cron');
     startSummaryCron();
+
+    // 支払期限アラート（毎朝9時 JST）
+    const { startPaymentAlertCron } = await import('./lib/payment-alert');
+    startPaymentAlertCron();
   }
 }
