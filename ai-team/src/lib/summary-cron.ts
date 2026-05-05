@@ -5,16 +5,16 @@ let initialized = false;
 
 /**
  * 日次サマリー通知のスケジュールを開始
- * 毎朝 9:00 JST (= 0:00 UTC) に実行
+ * 毎朝 9:00 JST（node-cron の timezone で固定。未指定だと OS の 0:00 になり 9 時とずれる）
  */
 export function startSummaryCron() {
   if (initialized) return;
   initialized = true;
 
-  cron.schedule('0 0 * * *', async () => {
+  cron.schedule('0 9 * * *', async () => {
     console.log(`[summary-cron] 日次サマリー送信開始`);
     await sendDailySummary();
-  });
+  }, { timezone: 'Asia/Tokyo' });
 
   console.log('[summary-cron] スケジュール登録完了: 毎朝 9:00 JST');
 }
